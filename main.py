@@ -6,19 +6,21 @@ Model, fitted fresh from each case file's own comparables at run time:
   express each hour as a log-ratio to that launch's own hour-1 print.  The
   shape of a launch day depends strongly on how big hour 1 already was:
   launches that open huge stay comparatively flat, launches that open small
-  grow much more over the day (in leave-one-out tests over the 37 launches
-  in the kit, the slope of the log-ratio on log hour-1 reaches about -0.9
-  by the evening hours).  So for each forecast hour we fit a least-squares
-  line of log-ratio against log hour-1 over the 18 launches whose hour-1
-  print is closest in log terms to this case's hour-1 print, and predict
-  at this case's hour-1 (clamped to 0.7 log units beyond the neighbours'
-  range, so an unprecedented hour-1 cannot extrapolate wildly).  The
-  spread comes from the fit's residuals: the average of the residuals'
-  empirical quantiles and normal quantiles from their interquartile
-  range, with a 0.15 floor on the implied sigma.  Quantile curves are
-  lightly smoothed across neighbouring hours.  Leave-one-out pinball loss
-  on the kit's launches was about 0.25 for launches opening at 10k+
-  viewers, against about 0.35 for the persistence baseline.
+  grow much more over the day (the slope of the log-ratio on log hour-1
+  reaches about -0.9 by the evening hours).  Two fits are averaged.  The
+  first fits a least-squares line of log-ratio against log hour-1 over
+  the 18 launches whose hour-1 print is closest in log terms to this
+  case's hour-1 print.  The second fits a weighted line over all the
+  launches, weighting each by how rolling-midnight-like its own day was:
+  a launch whose audience peaked near its hour-1 print keeps full
+  weight, while one that exploded to many times its hour-1 print fades
+  to nothing, since a simultaneous global unlock is not the shape of a
+  rolling-midnight launch.  Both fits predict at this case's hour-1,
+  clamped to 0.7 log units beyond the fitted launches' range, so an
+  unprecedented hour-1 cannot extrapolate wildly.  Spreads come from the
+  fits' residuals, and the averaged quantile curves are lightly smoothed
+  across neighbouring hours.  Leave-one-out tests over the kit's 37
+  launches guided the blend; the README records the numbers.
 
 Only the standard library is used.  No network, no clock, no randomness:
 the same case file always yields the same bytes.
@@ -42,6 +44,10 @@ Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
 NEIGHBOURS = 18
 SIGMA_FLOOR = 0.15
 EXTRAPOLATION_LIMIT = 0.7
+SHAPE_FULL = 2.5
+SHAPE_ZERO = 4.0
+ANALOGUE_SIGMA_FLOOR = 0.10
+ANALOGUE_SPREAD_SCALE = 1.05
 PERSISTENCE_SIGMA = 0.15
 MIN_LAUNCHES = 5
 MIN_PER_HOUR = 5
@@ -72,11 +78,15 @@ def interp_quantile(ordered, tau):
 
 
 def launch_curves(comparables):
-    """Release-day curves: {name: ({hour: viewers}, log hour-1)}.
+    """Release-day curves: [(name, {hour: viewers}, log hour-1, peak ratio)].
 
     A comparable counts only when its release day's hour 1 is present and
     at least half the day's hours are.  The target's own pre-release
     history entry has no release day and drops out here on its own.
+    The peak ratio (the day's highest hour over hour 1) measures how
+    rolling-midnight-like the launch was: near 1 for a launch that
+    opened big and stayed flat, in the hundreds for a launch whose
+    audience detonated long after a tiny first hour.
     """
     launches = []
     for entry in comparables or []:
@@ -95,7 +105,8 @@ def launch_curves(comparables):
                 curve[offset + 1] = max(1.0, float(viewers))
         if 1 in curve and len(curve) >= 12:
             name = entry.get("name") or ""
-            launches.append((str(name), curve, math.log(curve[1])))
+            peak = max(curve.values()) / curve[1]
+            launches.append((str(name), curve, math.log(curve[1]), peak))
     launches.sort(key=lambda item: item[0])
     return launches
 
@@ -112,7 +123,7 @@ def fit_hour(neighbours, hour, target_log_p1):
     Returns None when too few neighbours carry this hour.
     """
     points = []
-    for _, curve, log_p1 in neighbours:
+    for _, curve, log_p1, _peak in neighbours:
         if hour in curve:
             points.append((log_p1, math.log(curve[hour]) - log_p1))
     if len(points) < MIN_PER_HOUR:
@@ -136,17 +147,84 @@ def fit_hour(neighbours, hour, target_log_p1):
     return [0.5 * e + 0.5 * n for e, n in zip(empirical, normal)]
 
 
+def shape_weight(peak):
+    """How much a comparable's shape should count for a rolling-midnight day.
+
+    Full weight when the launch peaked at most SHAPE_FULL times its
+    hour-1 print, fading smoothly (cosine) to nothing at SHAPE_ZERO.
+    """
+    if peak <= SHAPE_FULL:
+        return 1.0
+    if peak >= SHAPE_ZERO:
+        return 0.0
+    fraction = (peak - SHAPE_FULL) / (SHAPE_ZERO - SHAPE_FULL)
+    return 0.5 * (1.0 + math.cos(math.pi * fraction))
+
+
+def fit_weighted_hour(launches, hour, target_log_p1):
+    """Weighted line over all launches, with a residual-SD spread.
+
+    Returns None when too few launches carry this hour.
+    """
+    points = []
+    for _, curve, log_p1, peak in launches:
+        if hour in curve:
+            points.append((log_p1, math.log(curve[hour]) - log_p1,
+                           shape_weight(peak)))
+    if len(points) < MIN_PER_HOUR:
+        return None
+    weighted = [point for point in points if point[2] > 1e-9]
+    if len(weighted) < MIN_PER_HOUR:
+        # Too few rolling-midnight-like launches: use the most alike
+        # five, unweighted, rather than trusting a near-empty fit.
+        weighted = sorted(points, key=lambda point: (-point[2], point[0]))
+        weighted = [(x, r, 1.0) for x, r, _ in weighted[:MIN_PER_HOUR]]
+    total = sum(point[2] for point in weighted)
+    if total <= 1e-9:
+        return None
+    mean_x = sum(w * x for x, _, w in weighted) / total
+    mean_r = sum(w * r for _, r, w in weighted) / total
+    denom = sum(w * (x - mean_x) ** 2 for x, _, w in weighted)
+    slope = 0.0
+    if denom > 1e-9:
+        slope = sum(w * (x - mean_x) * (r - mean_r)
+                    for x, r, w in weighted) / denom
+    xs = [point[0] for point in weighted]
+    clamped = min(max(target_log_p1, min(xs) - EXTRAPOLATION_LIMIT),
+                  max(xs) + EXTRAPOLATION_LIMIT)
+    centre = mean_r + slope * (clamped - mean_x)
+    residuals = [r - (mean_r + slope * (x - mean_x))
+                 for x, r, _ in weighted]
+    mean_res = sum(w * r for r, (_, _, w) in zip(residuals, weighted)) / total
+    variance = sum(w * (r - mean_res) ** 2
+                   for r, (_, _, w) in zip(residuals, weighted)) / total
+    sigma = max(ANALOGUE_SIGMA_FLOOR, math.sqrt(max(variance, 0.0)))
+    sigma *= ANALOGUE_SPREAD_SCALE
+    return [centre + z * sigma for z in Z_SCORES]
+
+
 def forecast_log_quantiles(p1, launches):
-    """Per-hour log-quantiles of the ratio to hour 1, smoothed across hours."""
+    """Per-hour log-quantiles of the ratio to hour 1, smoothed across hours.
+
+    Each hour averages the nearest-neighbour fit and the
+    rolling-midnight-weighted fit, so neither a single odd neighbour nor
+    a single odd analogue can dominate the forecast.
+    """
     target_log = math.log(p1)
     neighbours = sorted(launches, key=lambda item: (abs(item[2] - target_log), item[0]))
     neighbours = neighbours[:NEIGHBOURS]
     log_rows = {}
     for hour in range(2, 25):
-        fitted = fit_hour(neighbours, hour, target_log)
-        if fitted is None:
-            fitted = [math.log(max(1e-9, value / p1)) for value in persistence_row(p1, hour)]
-        log_rows[hour] = fitted
+        local = fit_hour(neighbours, hour, target_log)
+        if local is None:
+            local = [math.log(max(1e-9, value / p1)) for value in persistence_row(p1, hour)]
+        try:
+            analogue = fit_weighted_hour(launches, hour, target_log)
+        except (ArithmeticError, ValueError, TypeError):
+            analogue = None
+        if analogue is None:
+            analogue = local
+        log_rows[hour] = [0.5 * a + 0.5 * b for a, b in zip(local, analogue)]
     smoothed = {}
     for hour in range(2, 25):
         window = [h for h in (hour - 1, hour, hour + 1) if 2 <= h <= 24]
