@@ -10,7 +10,11 @@ Model, fitted fresh from each case file's own comparables at run time:
   reaches about -0.9 by the evening hours).  Two fits are averaged.  The
   first fits a least-squares line of log-ratio against log hour-1 over
   the 18 launches whose hour-1 print is closest in log terms to this
-  case's hour-1 print.  The second fits a weighted line over all the
+  case's hour-1 print, weighting launches released on the same weekday
+  four times as heavily: the day of the week shapes a launch day (a
+  Thursday launch faces a working Friday, a Friday launch the weekend),
+  and same-weekday launches proved the better guides.  The second fits a
+  weighted line over all the
   launches, weighting each by how rolling-midnight-like its own day was:
   a launch whose audience peaked near its hour-1 print keeps full
   weight, while one that exploded to many times its hour-1 print fades
@@ -42,6 +46,7 @@ LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z_SCORES = [-1.6448536269514722, -0.6744897501960817, 0.0,
             0.6744897501960817, 1.6448536269514722]
 NEIGHBOURS = 18
+WEEKDAY_WEIGHT = 4.0
 SIGMA_FLOOR = 0.15
 EXTRAPOLATION_LIMIT = 0.7
 SHAPE_FULL = 2.5
@@ -78,7 +83,8 @@ def interp_quantile(ordered, tau):
 
 
 def launch_curves(comparables):
-    """Release-day curves: [(name, {hour: viewers}, log hour-1, peak ratio)].
+    """Release-day curves: [(name, {hour: viewers}, log hour-1, peak ratio,
+    weekday)].
 
     A comparable counts only when its release day's hour 1 is present and
     at least half the day's hours are.  The target's own pre-release
@@ -86,7 +92,9 @@ def launch_curves(comparables):
     The peak ratio (the day's highest hour over hour 1) measures how
     rolling-midnight-like the launch was: near 1 for a launch that
     opened big and stayed flat, in the hundreds for a launch whose
-    audience detonated long after a tiny first hour.
+    audience detonated long after a tiny first hour.  The weekday is
+    the release day's day of the week (Monday 0), used only to match
+    launches released on the same weekday as the target's day.
     """
     launches = []
     for entry in comparables or []:
@@ -106,7 +114,8 @@ def launch_curves(comparables):
         if 1 in curve and len(curve) >= 12:
             name = entry.get("name") or ""
             peak = max(curve.values()) / curve[1]
-            launches.append((str(name), curve, math.log(curve[1]), peak))
+            weekday = (day_start // 86400 + 3) % 7
+            launches.append((str(name), curve, math.log(curve[1]), peak, weekday))
     launches.sort(key=lambda item: item[0])
     return launches
 
@@ -117,24 +126,34 @@ def persistence_row(p1, hour):
     return [p1 * math.exp(z * spread) for z in Z_SCORES]
 
 
-def fit_hour(neighbours, hour, target_log_p1):
+def fit_hour(neighbours, hour, target_log_p1, target_weekday=None):
     """Blend of empirical and normal quantiles for one hour's log-ratio.
 
-    Returns None when too few neighbours carry this hour.
+    The line is weighted: launches released on the same weekday as the
+    target's day count WEEKDAY_WEIGHT times as much, since the weekday
+    shapes the day's curve.  With no weekday to match, the fit is plain
+    least squares.  Returns None when too few neighbours carry this hour.
     """
     points = []
-    for _, curve, log_p1, _peak in neighbours:
+    weights = []
+    for _, curve, log_p1, _peak, weekday in neighbours:
         if hour in curve:
             points.append((log_p1, math.log(curve[hour]) - log_p1))
+            if target_weekday is not None and weekday == target_weekday:
+                weights.append(WEEKDAY_WEIGHT)
+            else:
+                weights.append(1.0)
     if len(points) < MIN_PER_HOUR:
         return None
     xs = [point[0] for point in points]
-    mean_x = sum(xs) / len(xs)
-    mean_r = sum(point[1] for point in points) / len(points)
-    denom = sum((x - mean_x) ** 2 for x in xs)
+    total = sum(weights)
+    mean_x = sum(w * x for w, (x, _) in zip(weights, points)) / total
+    mean_r = sum(w * r for w, (_, r) in zip(weights, points)) / total
+    denom = sum(w * (x - mean_x) ** 2 for w, (x, _) in zip(weights, points))
     slope = 0.0
     if denom > 1e-9:
-        slope = sum((x - mean_x) * (r - mean_r) for x, r in points) / denom
+        slope = sum(w * (x - mean_x) * (r - mean_r)
+                    for w, (x, r) in zip(weights, points)) / denom
     clamped = min(max(target_log_p1, min(xs) - EXTRAPOLATION_LIMIT),
                   max(xs) + EXTRAPOLATION_LIMIT)
     centre = mean_r + slope * (clamped - mean_x)
@@ -167,7 +186,7 @@ def fit_weighted_hour(launches, hour, target_log_p1):
     Returns None when too few launches carry this hour.
     """
     points = []
-    for _, curve, log_p1, peak in launches:
+    for _, curve, log_p1, peak, _weekday in launches:
         if hour in curve:
             points.append((log_p1, math.log(curve[hour]) - log_p1,
                            shape_weight(peak)))
@@ -203,7 +222,7 @@ def fit_weighted_hour(launches, hour, target_log_p1):
     return [centre + z * sigma for z in Z_SCORES]
 
 
-def forecast_log_quantiles(p1, launches):
+def forecast_log_quantiles(p1, launches, target_weekday=None):
     """Per-hour log-quantiles of the ratio to hour 1, smoothed across hours.
 
     Each hour averages the nearest-neighbour fit and the
@@ -215,7 +234,7 @@ def forecast_log_quantiles(p1, launches):
     neighbours = neighbours[:NEIGHBOURS]
     log_rows = {}
     for hour in range(2, 25):
-        local = fit_hour(neighbours, hour, target_log)
+        local = fit_hour(neighbours, hour, target_log, target_weekday)
         if local is None:
             local = [math.log(max(1e-9, value / p1)) for value in persistence_row(p1, hour)]
         try:
@@ -279,9 +298,13 @@ def forecast_case(case):
         launches = launch_curves(case.get("comparables"))
     except (TypeError, AttributeError):
         launches = []
+    try:
+        target_weekday = (parse_epoch(case["day_start"]) // 86400 + 3) % 7
+    except (KeyError, TypeError, ValueError, IndexError):
+        target_weekday = None
     if len(launches) >= MIN_LAUNCHES:
         try:
-            log_rows = forecast_log_quantiles(p1, launches)
+            log_rows = forecast_log_quantiles(p1, launches, target_weekday)
             return {"hours": [{"hour": h, "q": finish_row(p1, log_rows[h])}
                               for h in range(2, 25)]}
         except (ArithmeticError, ValueError, TypeError, KeyError):
